@@ -1,0 +1,66 @@
+name: Deploy Spring Boot to EC2
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    # Usamos Gradle en lugar de Maven
+    - name: Build with Gradle
+      run: ./gradlew bootJar -x test
+
+    - name: Set up SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+    - name: Copy JAR to EC2 via SCP
+      run: |
+        ssh -i ~/.ssh/deploy_key ec2-user@${{ secrets.EC2_HOST }} 'mkdir -p /home/ec2-user/app'
+        scp -i ~/.ssh/deploy_key build/libs/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
+
+    - name: Restart Spring Boot App via SSH
+      run: |
+        ssh -i ~/.ssh/deploy_key ec2-user@${{ secrets.EC2_HOST }} '
+          set -e
+          mkdir -p /home/ec2-user/app
+
+          # Instala el JRE/JDK en la instancia si no esta presente (idempotente)
+          command -v java >/dev/null 2>&1 || sudo dnf install -y java-21-amazon-corretto
+
+          # Matar cualquier proceso previo en el puerto 8080 o java
+          fuser -k 8080/tcp || true
+          pkill -x java || true
+          sleep 2
+
+          # Exportar variables de entorno de Microsoft Entra ID
+          export AZURE_CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}"
+          export AZURE_TENANT_ID="${{ secrets.AZURE_TENANT_ID }}"
+          export AZURE_APP_ID_URI="${{ secrets.AZURE_APP_ID_URI }}"
+
+          # setsid + stdin cerrado para desligar completamente la app del canal SSH
+          setsid java -jar /home/ec2-user/app/*.jar > /home/ec2-user/app/app.log 2>&1 < /dev/null &
+          disown || true
+
+          # Damos unos segundos para que arranque y salimos forzando salida limpia
+          sleep 3
+          exit 0
+        '

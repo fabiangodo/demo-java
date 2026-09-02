@@ -1,0 +1,1 @@
+ssh -i prueba.pem ec2-user@18.219.31.246
